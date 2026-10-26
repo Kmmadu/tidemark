@@ -1,0 +1,6 @@
+# Runtime dependencies for the Tidemark package.
+# The legacy AutoConfigBackup dependencies live in requirements.txt at the
+# repository root and apply only to legacy/.
+#
+# M0′ is intentionally empty: the core/store/cli packages in M0′ import
+# nothing outside the standard library. M1 fills this file.

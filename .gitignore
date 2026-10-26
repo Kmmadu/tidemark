@@ -58,3 +58,4 @@ In_progress.png
 *.temp
 __pycache__/
 *.pyc
+*.egg-info/

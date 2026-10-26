@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tidemark"
+version = "0.1.0"
+description = "Back up, compare and safely restore network device configurations over SSH."
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+gui = [
+    "PySide6>=6.7",
+    "pytest-qt>=4.4",
+]
+
+[project.scripts]
+tidemark = "tidemark.cli.main:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["tidemark-requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["tidemark*"]
+exclude = ["legacy*", "tests*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["legacy", "static", "templates", "backups", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "chr: integration test against a real MikroTik CHR (skipped unless TIDEMARK_CHR_* are set)",
+]
