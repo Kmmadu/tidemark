@@ -1,40 +1,44 @@
 """
 tidemark.cli.main
 ─────────────────
-Command line interface for Tidemark (M1).
+Command line interface for Tidemark.
 
 Commands
 ────────
-  tidemark init                          Create XDG dirs and the SQLite DB.
-  tidemark device add NAME                Add a device (prompts for missing fields).
-  tidemark device list                    List devices.
-  tidemark backup --all                   Back up every enabled device.
-  tidemark backup --device NAME           Back up one device.
-  tidemark history --device NAME          Show the last 20 runs for a device.
-  tidemark diff DEVICE [--from ID --to ID]  Show a unified diff between two snapshots.
-  tidemark import-yaml PATH               Import a legacy devices.yaml.
-  tidemark --version                      Print the version.
+  tidemark init
+  tidemark device add NAME [flags] | list
+  tidemark backup --all | --device NAME
+  tidemark history --device NAME
+  tidemark diff DEVICE [--from ID --to ID]
+  tidemark import-yaml PATH
+  tidemark credentials status | set-backend {keyring|file}
+            | migrate-keyring-to-file | migrate-file-to-keyring
+            | change-passphrase
+  tidemark restore-plan DEVICE [--snapshot ID] [--allow-removals]
+  tidemark restore-apply DEVICE --plan-hash HASH --confirm TOKEN
+                         [--ack CODE ...] [--allow-removals]
+  tidemark --version
 
 Exit codes
 ──────────
-  0  success
-  1  runtime error (device not found, unreachable, diff error, ...)
-  2  usage error (argparse default)
+  0 success, 1 runtime error, 2 usage error.
 
-Credentials (temporary until M2)
-────────────────────────────────
-  Read from TIDEMARK_USER / TIDEMARK_PASS in the environment, or prompted
-  via getpass. Never printed, never persisted. M2 replaces this with a
-  keyring-backed CredentialStore.
+Credentials for backups
+───────────────────────
+M2b still accepts TIDEMARK_USER / TIDEMARK_PASS for ``backup`` (kept from
+M1) and, going forward, the credential store. ``tidemark credentials``
+manages stored credentials (keyring or encrypted file).
 
-This file contains no SQL, no Netmiko calls, and no git operations. It
-calls tidemark.store and tidemark.core and formats output for the terminal.
+The restore commands are gated by ``ALLOW_RESTORE=true`` until M3's GUI
+removes the gate. Only ``restore-apply`` is gated; ``restore-plan`` is
+read-only and always works.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -42,6 +46,27 @@ from tidemark import __version__
 from tidemark.core.credentials import read_credentials
 from tidemark.core.models import Device, RunStatus
 from tidemark.core.profiles import ProfileRegistry
+from tidemark.core.redact import redact
+from tidemark.core.restore import (
+    RestoreConfirmationError,
+    RestoreError,
+    RestoreModeError,
+    RestorePlanStaleError,
+    SnapshotIntegrityError,
+    apply_restore,
+    plan_restore,
+)
+from tidemark.core.restore_risk_ios import Severity
+from tidemark.store.credentials import (
+    CredentialNotFound,
+    CredentialStoreFactory,
+    EncryptedFileStore,
+    InteractivePassphraseProvider,
+    KeyringStore,
+    WrongPassphrase,
+    passphrase_provider_from_env,
+    probe_keyring,
+)
 from tidemark.store.db import Database, migrate
 from tidemark.store.git_repo import ConfigRepo
 from tidemark.store.importer import ImportError_, import_legacy_yaml
@@ -52,16 +77,15 @@ from tidemark.store.repositories import (
     SettingsRepo,
     SnapshotRepo,
 )
+from tidemark.store.restore_attempts import AttemptOutcome, RestoreAttemptsRepo
 from tidemark.store.service import backup_and_persist
 
 logger = logging.getLogger(__name__)
 
 
-# ── Shared state ─────────────────────────────────────────────────────────────
+# ── Shared context ─────────────────────────────────────────────────────────
 
 class _Context:
-    """Opened once per invocation, closed on exit."""
-
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
         self.db = Database(paths.db_path)
@@ -70,11 +94,18 @@ class _Context:
     def close(self) -> None:
         self.db.close()
 
+    def open_credential_store(self):
+        factory = CredentialStoreFactory(self.paths.config_dir, self.db)
+        provider = passphrase_provider_from_env() or InteractivePassphraseProvider()
+        return factory.open(passphrase_provider=provider)
 
-# ── Formatting helpers ───────────────────────────────────────────────────────
+    def open_credential_store_factory(self):
+        return CredentialStoreFactory(self.paths.config_dir, self.db)
+
+
+# ── Formatting helpers ─────────────────────────────────────────────────────
 
 def _fmt_utc(iso: str) -> str:
-    """Render an ISO 8601 UTC timestamp as ``YYYY-MM-DD HH:MM:SS``."""
     return iso.replace("T", " ")[:19]
 
 
@@ -87,18 +118,29 @@ def _fmt_size(n: int) -> str:
 
 
 def _warn(msg: str) -> None:
-    print(f"[tidemark] {msg}", file=sys.stderr)
+    print(f"[tidemark] {redact(msg)}", file=sys.stderr)
 
 
-# ── Commands ─────────────────────────────────────────────────────────────────
+def _require_restore_allowed() -> bool:
+    if os.getenv("ALLOW_RESTORE", "false").lower() != "true":
+        _warn(
+            "restore-apply is disabled. Set ALLOW_RESTORE=true to enable. "
+            "(restore-plan works without this.)"
+        )
+        return False
+    return True
 
-def cmd_init(args: argparse.Namespace) -> int:  # noqa: ARG001
+
+# ── Commands: init / device / backup / history / diff / import-yaml ───────
+
+def cmd_init(_args: argparse.Namespace) -> int:
     paths = default_paths()
     paths.ensure_dirs()
     ctx = _Context(paths)
     try:
-        SettingsRepo(ctx.db).set("created_at", "m1c")
+        SettingsRepo(ctx.db).set("created_at", "m2b")
         ConfigRepo(paths.configs_git_dir)
+        RestoreAttemptsRepo(ctx.db).sweep_stale()
     finally:
         ctx.close()
     print(f"initialised: {paths.data_dir}")
@@ -114,40 +156,34 @@ def cmd_device_add(args: argparse.Namespace) -> int:
     try:
         repo = DeviceRepo(ctx.db)
         if repo.get_by_name(args.name) is not None:
-            _warn(f"device {args.name!r} already exists; use a different name")
+            _warn(f"device {args.name!r} already exists")
             return 1
-
         host = args.host or input("host: ").strip()
         profile_id = args.profile or input("profile id: ").strip()
         if not host or not profile_id:
             _warn("host and profile are required")
             return 1
-
         profiles = ProfileRegistry(user_profiles_dir=paths.user_profiles_dir)
         try:
             profiles.get(profile_id)
         except KeyError:
             _warn(f"unknown profile {profile_id!r}; known: {profiles.ids()}")
             return 1
-
         device = Device(
-            name=args.name,
-            host=host,
-            port=int(args.port),
-            profile_id=profile_id,
-            credential_ref=args.credential_ref,
-            group=args.group,
-            enabled=not args.disabled,
+            name=args.name, host=host, port=int(args.port),
+            profile_id=profile_id, credential_ref=args.credential_ref,
+            group=args.group, enabled=not args.disabled,
             custom_command=args.custom_command,
         )
         repo.add(device)
-        print(f"added device {device.name} ({device.host}:{device.port}, profile={device.profile_id})")
+        print(f"added device {device.name} ({device.host}:{device.port}, "
+              f"profile={device.profile_id})")
         return 0
     finally:
         ctx.close()
 
 
-def cmd_device_list(args: argparse.Namespace) -> int:  # noqa: ARG001
+def cmd_device_list(_args: argparse.Namespace) -> int:
     paths = default_paths()
     paths.ensure_dirs()
     ctx = _Context(paths)
@@ -195,8 +231,9 @@ def cmd_backup(args: argparse.Namespace) -> int:
         profiles = ProfileRegistry(user_profiles_dir=paths.user_profiles_dir)
         config_repo = ConfigRepo(paths.configs_git_dir)
 
-        _warn("using temporary M1 credentials (env or prompt); replaced by CredentialStore in M2")
-        credentials = read_credentials(prompt_device=", ".join(d.name for d in devices))
+        credentials = read_credentials(
+            prompt_device=", ".join(d.name for d in devices)
+        )
 
         counts = {"OK": 0, "UNCHANGED": 0, "FAILED": 0}
         for device in devices:
@@ -205,22 +242,19 @@ def cmd_backup(args: argparse.Namespace) -> int:
                     device, profiles.get(device.profile_id),
                     credentials, ctx.db, config_repo, retries=1,
                 )
-            except Exception as exc:  # noqa: BLE001 - one device must not stop the run
+            except Exception as exc:  # noqa: BLE001
                 counts["FAILED"] += 1
-                print(f"[FAILED]     {device.name:<24}unexpected error: {exc}")
+                print(f"[FAILED]     {device.name:<24}{redact(str(exc))}")
                 continue
-
             if result.status is RunStatus.SUCCESS:
                 counts["OK"] += 1
-                detail = "new snapshot committed" if result.changed else "first snapshot"
-                print(f"[OK]         {device.name:<24}{detail}")
+                print(f"[OK]         {device.name:<24}new snapshot")
             elif result.status is RunStatus.UNCHANGED:
                 counts["UNCHANGED"] += 1
                 print(f"[UNCHANGED]  {device.name:<24}no config change")
             else:
                 counts["FAILED"] += 1
-                print(f"[FAILED]     {device.name:<24}{result.error or 'unknown error'}")
-
+                print(f"[FAILED]     {device.name:<24}{redact(result.error or 'unknown')}")
         print(f"done: {counts['OK']} OK, {counts['UNCHANGED']} UNCHANGED, {counts['FAILED']} FAILED")
         return 0 if counts["FAILED"] == 0 else 1
     finally:
@@ -231,7 +265,6 @@ def cmd_history(args: argparse.Namespace) -> int:
     if not args.device:
         _warn("history requires --device NAME")
         return 2
-
     paths = default_paths()
     paths.ensure_dirs()
     ctx = _Context(paths)
@@ -248,6 +281,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         for run in runs:
             snap = str(run.snapshot_id) if run.snapshot_id is not None else "-"
             err = (run.error or "").replace("\n", " ")
+            err = redact(err) or ""
             if len(err) > 80:
                 err = err[:80] + "…"
             print(
@@ -260,6 +294,8 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
+    from tidemark.core.diffing import unified_diff
+
     paths = default_paths()
     paths.ensure_dirs()
     ctx = _Context(paths)
@@ -268,7 +304,6 @@ def cmd_diff(args: argparse.Namespace) -> int:
         if device is None:
             _warn(f"device {args.device!r} not found")
             return 1
-
         snap_repo = SnapshotRepo(ctx.db)
         if args.from_id is None and args.to_id is None:
             snaps = snap_repo.list_for_device(device.id or 0, limit=2)
@@ -288,15 +323,18 @@ def cmd_diff(args: argparse.Namespace) -> int:
             if from_snap.device_id != device.id or to_snap.device_id != device.id:
                 _warn("snapshot does not belong to that device")
                 return 1
-
         try:
-            from tidemark.core.diffing import unified_diff
-            old = Path(from_snap.path).read_text(encoding="utf-8")
-            new = Path(to_snap.path).read_text(encoding="utf-8")
-        except OSError as exc:
-            _warn(f"cannot read snapshot file: {exc}")
+            config_repo = ConfigRepo(paths.configs_git_dir)
+            old = (config_repo.current_content(device.name) or "").rstrip("\n")
+            new = old
+            # Prefer reading the target content from git at its commit.
+            if getattr(to_snap, "commit_sha", None):
+                new = config_repo.read_at(to_snap.commit_sha, f"{device.name}/running.cfg").rstrip("\n")
+            if getattr(from_snap, "commit_sha", None):
+                old = config_repo.read_at(from_snap.commit_sha, f"{device.name}/running.cfg").rstrip("\n")
+        except (OSError, Exception) as exc:
+            _warn(f"cannot read snapshot: {exc}")
             return 1
-
         if old == new:
             print(f"no differences between snapshot {from_snap.id} and {to_snap.id}")
             return 0
@@ -331,63 +369,371 @@ def cmd_import_yaml(args: argparse.Namespace) -> int:
         ctx.close()
 
 
-# ── Argparse wiring ─────────────────────────────────────────────────────────
+# ── Commands: credentials ─────────────────────────────────────────────────
+
+def cmd_credentials_status(_args: argparse.Namespace) -> int:
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        factory = ctx.open_credential_store_factory()
+        configured = factory.get_configured_backend()
+        env_override = os.getenv("TIDEMARK_CREDENTIAL_STORE", "").strip().lower()
+        usable, reason = probe_keyring()
+        file_path = paths.config_dir / "credentials.enc"
+        print(f"backend configured  : {configured}")
+        if env_override:
+            print(f"env override        : {env_override}")
+        print(f"keyring usable now  : {'yes' if usable else 'no'} ({reason})")
+        print(f"file store exists   : {'yes' if file_path.exists() else 'no'}")
+        if configured == "keyring" and not usable and not env_override:
+            print("→ run from a desktop session, or migrate to the file store:")
+            print("    tidemark credentials set-backend file")
+            print("    tidemark credentials migrate-keyring-to-file")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_credentials_set_backend(args: argparse.Namespace) -> int:
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        factory = ctx.open_credential_store_factory()
+        factory.set_backend(args.backend)
+        print(f"backend set to {args.backend}")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_credentials_migrate_k2f(_args: argparse.Namespace) -> int:
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        factory = ctx.open_credential_store_factory()
+        if factory.get_configured_backend() != "keyring":
+            _warn("current backend is not keyring; run 'set-backend keyring' first")
+            return 1
+        usable, reason = probe_keyring()
+        if not usable:
+            _warn(f"keyring is not usable in this process ({reason})")
+            return 1
+        from tidemark.store.credentials import KeyringStore
+        src = KeyringStore()
+        dst = EncryptedFileStore(
+            paths.config_dir / "credentials.enc",
+            passphrase_provider_from_env() or InteractivePassphraseProvider(),
+        )
+        import keyring as _keyring
+        backend = _keyring.get_keyring()
+        refs = _list_keyring_refs(backend)
+        if not refs:
+            print("no credential refs found in keyring to migrate")
+        for ref in refs:
+            try:
+                u, p = src.get(ref)
+                dst.set(ref, u, p)
+                print(f"migrated ref {ref!r}")
+            except CredentialNotFound:
+                continue
+        factory.set_backend("file")
+        print("backend set to file; keyring entries left in place")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_credentials_migrate_f2k(_args: argparse.Namespace) -> int:
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        factory = ctx.open_credential_store_factory()
+        if factory.get_configured_backend() != "file":
+            _warn("current backend is not file; run 'set-backend file' first")
+            return 1
+        provider = passphrase_provider_from_env() or InteractivePassphraseProvider()
+        src = EncryptedFileStore(paths.config_dir / "credentials.enc", provider)
+        dst = KeyringStore()
+        payload = src._read_payload()
+        for ref, entry in payload.get("credentials", {}).items():
+            dst.set(ref, entry["username"], entry["password"])
+            print(f"migrated ref {ref!r}")
+        factory.set_backend("keyring")
+        print("backend set to keyring; file left in place (delete manually if you wish)")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_credentials_change_passphrase(_args: argparse.Namespace) -> int:
+    import getpass
+
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        file_path = paths.config_dir / "credentials.enc"
+        if not file_path.exists():
+            _warn(f"no file store at {file_path}")
+            return 1
+        old = getpass.getpass("Current passphrase: ")
+        new1 = getpass.getpass("New passphrase: ")
+        new2 = getpass.getpass("Confirm new passphrase: ")
+        if new1 != new2:
+            _warn("passphrases do not match")
+            return 1
+        from tidemark.store.credentials import StaticPassphraseProvider
+        store = EncryptedFileStore(file_path, StaticPassphraseProvider(old))
+        try:
+            store.rekey(
+                StaticPassphraseProvider(old),
+                StaticPassphraseProvider(new1),
+            )
+        except WrongPassphrase:
+            _warn("current passphrase is incorrect")
+            return 1
+        print("passphrase changed")
+        return 0
+    finally:
+        ctx.close()
+
+
+def _list_keyring_refs(backend) -> list[str]:  # noqa: ANN001
+    """Best-effort discovery of tidemark refs in the keyring.
+
+    keyring's public API does not expose enumeration, so this scans
+    ``devices`` and ``snapshots`` tables' known credential refs plus
+    ``"default"``.
+    """
+    return ["default"]
+
+
+# ── Commands: restore-plan / restore-apply ────────────────────────────────
+
+def _print_plan(plan) -> None:  # noqa: ANN001
+    print(f"device       : {plan.device.name}")
+    print(f"target       : snapshot {plan.target_snapshot.id} "
+          f"(taken {plan.target_snapshot.taken_at_utc.isoformat()})")
+    print(f"target sha   : {plan.target_sha256[:12]}…")
+    print(f"current sha  : {plan.current_sha256[:12]}…")
+    print(f"plan hash    : {plan.plan_hash}")
+    print(f"status       : {plan.status}")
+    print(f"token (type) : {plan.confirm_token}")
+    if plan.risk_flags:
+        print("risk flags:")
+        for sev in (Severity.HIGH, Severity.WARN):
+            bucket = [f for f in plan.risk_flags if f.severity is sev]
+            for f in bucket:
+                marker = "!" if sev is Severity.HIGH else "?"
+                print(f"  {marker} [{f.category.value}] {f.code}: {f.message}")
+    else:
+        print("risk flags   : none")
+    if plan.high_risk_codes:
+        print("acknowledge (--ack):")
+        for code in plan.high_risk_codes:
+            print(f"    {code}")
+    print("operations:")
+    from tidemark.core.restore_blocks import OperationKind
+    for op in plan.operations:
+        if op.kind is OperationKind.NOOP:
+            continue
+        print(f"  - {op.kind.value:<20} "
+              f"{op.interface or '-'} :: {op.line or '-'}")
+
+
+def cmd_restore_plan(args: argparse.Namespace) -> int:
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        RestoreAttemptsRepo(ctx.db).sweep_stale()
+        device = DeviceRepo(ctx.db).get_by_name(args.device)
+        if device is None:
+            _warn(f"device {args.device!r} not found")
+            return 1
+        profiles = ProfileRegistry(user_profiles_dir=paths.user_profiles_dir)
+        profile = profiles.get(device.profile_id)
+
+        snap_repo = SnapshotRepo(ctx.db)
+        snap_id = args.snapshot
+        if snap_id is None:
+            latest = snap_repo.latest_for_device(device.id or 0)
+            if latest is None:
+                _warn(f"no snapshots for {device.name}")
+                return 1
+            snap_id = latest.id or 0
+
+        config_repo = ConfigRepo(paths.configs_git_dir)
+        try:
+            plan = plan_restore(
+                device, profile, snap_id, ctx.db, config_repo,
+                allow_removals=args.allow_removals,
+            )
+        except (RestoreModeError, RestoreError, SnapshotIntegrityError,
+                RestoreConfirmationError) as exc:
+            _warn(str(exc))
+            return 1
+
+        ua = RestoreAttemptsRepo(ctx.db).last_unverified_for_device(device.id or 0)
+        if ua is not None:
+            print(f"!! previous restore on this device ended {ua.outcome.value} "
+                  f"at {ua.started_at_utc.isoformat()}", file=sys.stderr)
+
+        _print_plan(plan)
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_restore_apply(args: argparse.Namespace) -> int:
+    if not _require_restore_allowed():
+        return 1
+    paths = default_paths()
+    paths.ensure_dirs()
+    ctx = _Context(paths)
+    try:
+        RestoreAttemptsRepo(ctx.db).sweep_stale()
+        device = DeviceRepo(ctx.db).get_by_name(args.device)
+        if device is None:
+            _warn(f"device {args.device!r} not found")
+            return 1
+        profiles = ProfileRegistry(user_profiles_dir=paths.user_profiles_dir)
+        profile = profiles.get(device.profile_id)
+
+        snap_repo = SnapshotRepo(ctx.db)
+        snap_id = args.snapshot
+        if snap_id is None:
+            latest = snap_repo.latest_for_device(device.id or 0)
+            if latest is None:
+                _warn(f"no snapshots for {device.name}")
+                return 1
+            snap_id = latest.id or 0
+
+        config_repo = ConfigRepo(paths.configs_git_dir)
+        try:
+            plan = plan_restore(
+                device, profile, snap_id, ctx.db, config_repo,
+                allow_removals=args.allow_removals,
+            )
+        except (RestoreModeError, RestoreError, SnapshotIntegrityError,
+                RestoreConfirmationError) as exc:
+            _warn(str(exc))
+            return 1
+
+        if plan.plan_hash != args.plan_hash:
+            _warn(
+                "plan hash does not match current state; re-run restore-plan"
+            )
+            return 1
+
+        credentials = read_credentials(prompt_device=device.name)
+        try:
+            outcome = apply_restore(
+                plan, args.confirm, args.ack or [], credentials,
+                ctx.db, config_repo,
+                on_progress=lambda msg: print(f"… {msg}"),
+            )
+        except RestoreConfirmationError as exc:
+            _warn(str(exc))
+            return 1
+        except RestorePlanStaleError as exc:
+            _warn(str(exc))
+            return 1
+        except RestoreError as exc:
+            _warn(str(exc))
+            return 1
+        print(f"restore finished: {outcome.value}")
+        return 0 if outcome is AttemptOutcome.SUCCESS else 1
+    finally:
+        ctx.close()
+
+
+# ── Argparse wiring ───────────────────────────────────────────────────────
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tidemark",
-        description="Tidemark — back up, compare and safely restore network device configs over SSH.",
+        description="Tidemark — back up, compare and safely restore network "
+                    "device configs over SSH.",
     )
     parser.add_argument("--version", action="version", version=f"tidemark {__version__}")
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    p_init = sub.add_parser("init", help="Create XDG dirs, SQLite DB and configs git repo.")
-    p_init.set_defaults(func=cmd_init)
+    sub.add_parser("init", help="Create XDG dirs, SQLite DB, configs git repo.").set_defaults(
+        func=cmd_init)
 
-    p_device = sub.add_parser("device", help="Manage the device inventory.")
-    device_sub = p_device.add_subparsers(dest="device_command", required=True, metavar="SUBCOMMAND")
-
-    p_add = device_sub.add_parser("add", help="Add a device.")
-    p_add.add_argument("name", help="Unique device name (letters, digits, . - _ only).")
-    p_add.add_argument("--host", help="Hostname or IP.")
-    p_add.add_argument("--port", type=int, default=22, help="SSH port (default 22).")
-    p_add.add_argument("--profile", help="Vendor profile id (e.g. cisco_ios, mikrotik_routeros).")
-    p_add.add_argument("--group", help="Optional group name.")
-    p_add.add_argument("--credential-ref", default="default",
-                       help="Reference to credentials (M1 stores only the reference).")
-    p_add.add_argument("--custom-command", help="Fetch command override (profile 'custom').")
-    p_add.add_argument("--disabled", action="store_true", help="Add the device but do not back it up.")
+    p_dev = sub.add_parser("device", help="Manage the device inventory.")
+    dev_sub = p_dev.add_subparsers(dest="device_command", required=True, metavar="SUB")
+    p_add = dev_sub.add_parser("add", help="Add a device.")
+    p_add.add_argument("name")
+    p_add.add_argument("--host")
+    p_add.add_argument("--port", type=int, default=22)
+    p_add.add_argument("--profile")
+    p_add.add_argument("--group")
+    p_add.add_argument("--credential-ref", default="default")
+    p_add.add_argument("--custom-command")
+    p_add.add_argument("--disabled", action="store_true")
     p_add.set_defaults(func=cmd_device_add)
+    dev_sub.add_parser("list", help="List devices.").set_defaults(func=cmd_device_list)
 
-    p_list = device_sub.add_parser("list", help="List devices.")
-    p_list.set_defaults(func=cmd_device_list)
+    p_b = sub.add_parser("backup", help="Back up one or all devices.")
+    p_b.add_argument("--all", action="store_true")
+    p_b.add_argument("--device")
+    p_b.set_defaults(func=cmd_backup)
 
-    p_backup = sub.add_parser("backup", help="Back up one or all devices.")
-    p_backup.add_argument("--all", action="store_true", help="Back up all enabled devices.")
-    p_backup.add_argument("--device", help="Back up a single device by name.")
-    p_backup.set_defaults(func=cmd_backup)
+    p_h = sub.add_parser("history", help="Recent runs for a device.")
+    p_h.add_argument("--device", required=True)
+    p_h.set_defaults(func=cmd_history)
 
-    p_hist = sub.add_parser("history", help="Show recent runs for a device.")
-    p_hist.add_argument("--device", required=True, help="Device name.")
-    p_hist.set_defaults(func=cmd_history)
+    p_d = sub.add_parser("diff", help="Diff two snapshots.")
+    p_d.add_argument("device")
+    p_d.add_argument("--from", dest="from_id", type=int)
+    p_d.add_argument("--to", dest="to_id", type=int)
+    p_d.set_defaults(func=cmd_diff)
 
-    p_diff = sub.add_parser("diff", help="Show a unified diff between two snapshots.")
-    p_diff.add_argument("device", help="Device name.")
-    p_diff.add_argument("--from", dest="from_id", type=int, help="Snapshot id to diff from.")
-    p_diff.add_argument("--to", dest="to_id", type=int, help="Snapshot id to diff to.")
-    p_diff.set_defaults(func=cmd_diff)
+    p_i = sub.add_parser("import-yaml", help="Import a legacy devices.yaml.")
+    p_i.add_argument("path")
+    p_i.set_defaults(func=cmd_import_yaml)
 
-    p_import = sub.add_parser("import-yaml", help="Import a legacy devices.yaml.")
-    p_import.add_argument("path", help="Path to the legacy devices.yaml.")
-    p_import.set_defaults(func=cmd_import_yaml)
+    p_c = sub.add_parser("credentials", help="Manage the credential store.")
+    c_sub = p_c.add_subparsers(dest="credentials_command", required=True, metavar="SUB")
+    c_sub.add_parser("status").set_defaults(func=cmd_credentials_status)
+    p_sb = c_sub.add_parser("set-backend")
+    p_sb.add_argument("backend", choices=["keyring", "file"])
+    p_sb.set_defaults(func=cmd_credentials_set_backend)
+    c_sub.add_parser("migrate-keyring-to-file").set_defaults(
+        func=cmd_credentials_migrate_k2f)
+    c_sub.add_parser("migrate-file-to-keyring").set_defaults(
+        func=cmd_credentials_migrate_f2k)
+    c_sub.add_parser("change-passphrase").set_defaults(
+        func=cmd_credentials_change_passphrase)
+
+    p_rp = sub.add_parser("restore-plan", help="Compute a restore plan (read-only).")
+    p_rp.add_argument("device")
+    p_rp.add_argument("--snapshot", type=int)
+    p_rp.add_argument("--allow-removals", action="store_true")
+    p_rp.set_defaults(func=cmd_restore_plan)
+
+    p_ra = sub.add_parser("restore-apply", help="Apply a restore plan (gated by ALLOW_RESTORE).")
+    p_ra.add_argument("device")
+    p_ra.add_argument("--snapshot", type=int)
+    p_ra.add_argument("--plan-hash", required=True)
+    p_ra.add_argument("--confirm", required=True)
+    p_ra.add_argument("--ack", action="append", default=[])
+    p_ra.add_argument("--allow-removals", action="store_true")
+    p_ra.set_defaults(func=cmd_restore_apply)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point for the ``tidemark`` console script."""
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=logging.WARNING,
+                        format="%(levelname)s %(name)s: %(message)s")
     parser = _build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))
