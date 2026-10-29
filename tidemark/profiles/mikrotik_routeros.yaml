@@ -1,0 +1,28 @@
+# MikroTik RouterOS — tested profile.
+#
+# `min_length` is in characters. RouterOS /export output is short on tiny
+# devices but never empty; 100 characters is a conservative floor.
+#
+# RouterOS v7 /export hides secrets by default, so a fresh CHR may produce a
+# clean-looking export even when redaction is broken. Do not use a live CHR
+# export as proof that redaction works; that is M2's job.
+id: mikrotik_routeros
+display_name: MikroTik RouterOS
+netmiko_device_type: mikrotik_routeros
+fetch_commands:
+  - "/export terse"
+pre_commands:
+  - "/terminal length 0"
+volatile_patterns:
+  - "^# .*(last modified|uptime|version)"
+  - "^# [A-Z][a-z]{2}/[0-9]{2}/[0-9]{4}"
+invalid_patterns:
+  - "bad command name"
+  - "syntax error"
+  - "^Error:"
+min_length: 100
+requires_enable: false
+restore: none
+tested: true
+description: >
+  Tested against MikroTik CHR. /export hides secrets by default in v7.

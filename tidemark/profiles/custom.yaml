@@ -1,0 +1,21 @@
+# "Custom" profile — you type the config command yourself.
+#
+# Because this profile's fetch command is a placeholder, M1c's `device add`
+# will reject devices that reference `custom` without `--custom-command`.
+#
+# The M1 driver reads the command from the device (not the profile) when
+# profile_id == "custom". Add the actual command to the device row.
+id: custom
+display_name: Custom (user-supplied command)
+netmiko_device_type: generic
+fetch_commands:
+  - "show running-config"
+pre_commands: []
+volatile_patterns: []
+invalid_patterns: []
+min_length: 1
+requires_enable: false
+restore: none
+tested: false
+description: >
+  Anything reachable over SSH. Set the fetch command per device.

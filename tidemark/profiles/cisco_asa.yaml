@@ -1,0 +1,17 @@
+id: cisco_asa
+display_name: Cisco ASA
+netmiko_device_type: cisco_asa
+fetch_commands:
+  - "show running-config"
+pre_commands:
+  - "terminal pager 0"
+volatile_patterns:
+  - "^: Saved"
+  - "^: Serial Number: .*"
+invalid_patterns:
+  - "ERROR:"
+min_length: 200
+requires_enable: true
+restore: none
+tested: false
+description: Community profile; untested in Tidemark.

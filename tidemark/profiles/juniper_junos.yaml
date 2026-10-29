@@ -1,0 +1,18 @@
+id: juniper_junos
+display_name: Juniper Junos
+netmiko_device_type: juniper_junos
+fetch_commands:
+  - "show configuration | display set"
+pre_commands:
+  - "set cli screen-length 0"
+  - "set cli screen-width 0"
+volatile_patterns:
+  - "^## Last commit: .*"
+  - "^## Last changed: .*"
+invalid_patterns:
+  - "syntax error"
+min_length: 100
+requires_enable: false
+restore: none
+tested: false
+description: Community profile; untested in Tidemark.

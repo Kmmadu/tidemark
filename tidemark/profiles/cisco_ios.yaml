@@ -1,0 +1,28 @@
+# Cisco IOS — tested profile.
+#
+# `min_length` is in characters.
+id: cisco_ios
+display_name: Cisco IOS
+netmiko_device_type: cisco_ios
+fetch_commands:
+  - "show running-config"
+pre_commands:
+  - "terminal length 0"
+volatile_patterns:
+  - "^Building configuration\\.\\.\\.$"
+  - "^Current configuration : .*"
+  - "^! Last configuration change at .*"
+  - "^! NVRAM config last updated at .*"
+  - "^ntp clock-period .*"
+invalid_patterns:
+  - "% Invalid input"
+  - "% Ambiguous command"
+  - "% Incomplete command"
+  - "% Unknown command"
+  - "syntax error"
+min_length: 200
+requires_enable: true
+restore: cli_delta
+tested: true
+description: >
+  Tested against Cisco IOS. Requires enable. Restore mode cli_delta (M2).

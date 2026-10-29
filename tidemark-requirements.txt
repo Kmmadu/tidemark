@@ -2,5 +2,14 @@
 # The legacy AutoConfigBackup dependencies live in requirements.txt at the
 # repository root and apply only to legacy/.
 #
-# M0′ is intentionally empty: the core/store/cli packages in M0′ import
-# nothing outside the standard library. M1 fills this file.
+# M1a: driver + profiles
+netmiko>=4.4
+PyYAML>=6.0
+
+# M1b: storage
+GitPython>=3.1
+platformdirs>=4.0
+
+# M2a: credentials
+keyring>=24.0
+cryptography>=42.0

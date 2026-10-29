@@ -1,0 +1,15 @@
+id: linux_generic
+display_name: Linux (generic)
+netmiko_device_type: linux
+fetch_commands:
+  - "cat /etc/os-release; echo '---'; uname -a"
+pre_commands: []
+volatile_patterns: []
+invalid_patterns: []
+min_length: 20
+requires_enable: false
+restore: none
+tested: false
+description: >
+  Community profile for a plain Linux box. The "config" is os-release and
+  uname by default; override with a user profile if you need more.

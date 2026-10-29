@@ -1,0 +1,17 @@
+id: cisco_nxos
+display_name: Cisco NX-OS
+netmiko_device_type: cisco_nxos
+fetch_commands:
+  - "show running-config"
+pre_commands:
+  - "terminal length 0"
+volatile_patterns:
+  - "^!Time: .*"
+  - "^!Running configuration last done at: .*"
+invalid_patterns:
+  - "% Invalid command"
+min_length: 200
+requires_enable: false
+restore: none
+tested: false
+description: Community profile; untested in Tidemark.
