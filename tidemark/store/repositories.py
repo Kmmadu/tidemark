@@ -118,8 +118,9 @@ class SnapshotRepo:
         cur = self._db.conn.execute(
             """
             INSERT INTO snapshots
-                (device_id, taken_at_utc, sha256, path, size, kind, commit_sha)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (device_id, taken_at_utc, sha256, path, size, kind,
+                 commit_sha, is_redacted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.device_id,
@@ -129,6 +130,7 @@ class SnapshotRepo:
                 snapshot.size,
                 snapshot.kind,
                 getattr(snapshot, "commit_sha", None),
+                int(snapshot.is_redacted),
             ),
         )
         snapshot.id = int(cur.lastrowid)
@@ -146,7 +148,6 @@ class SnapshotRepo:
             (device_id,),
         ).fetchone()
         if row is None:
-            # No runs yet; fall back to most recent normal snapshot.
             row = self._db.conn.execute(
                 """
                 SELECT * FROM snapshots
@@ -276,6 +277,7 @@ def _row_to_snapshot(row) -> Snapshot:  # noqa: ANN001
         path=row["path"],
         size=int(row["size"]),
         kind=row["kind"],
+        is_redacted=bool(row["is_redacted"]),
     )
     setattr(snap, "commit_sha", row["commit_sha"])  # noqa: B010 - extend dataclass
     return snap

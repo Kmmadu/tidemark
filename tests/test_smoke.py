@@ -5,11 +5,21 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# Matches `import flask`, `from flask import ...`, `import legacy`, `from legacy.x import ...`,
+# `import app`, `from app import ...` — as import statements, not as substrings.
+_FORBIDDEN_IMPORT = re.compile(
+    r"(?m)^\s*(?:"
+    r"import\s+(?:flask|legacy|app)\b"
+    r"|from\s+(?:flask|legacy|app)(?:\.|\s)"
+    r")"
+)
 
 
 def test_version_string() -> None:
@@ -50,16 +60,10 @@ def test_cli_version_runs() -> None:
 def test_no_legacy_or_flask_imports(module_name: str) -> None:
     module = importlib.import_module(module_name)
     source = Path(module.__file__).read_text(encoding="utf-8")
-    forbidden = (
-        "import flask",
-        "from flask",
-        "import app",
-        "from app ",
-        "import legacy",
-        "from legacy",
+    match = _FORBIDDEN_IMPORT.search(source)
+    assert match is None, (
+        f"{module_name} has a forbidden import at {match.group(0)!r}"
     )
-    for needle in forbidden:
-        assert needle not in source, f"{module_name} imports {needle!r}"
 
 
 def test_packages_have_no_unexpected_modules() -> None:

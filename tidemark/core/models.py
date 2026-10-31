@@ -95,8 +95,8 @@ class Snapshot:
     path: str
     size: int
     kind: str = "normal"  # "normal" | "pre_restore"
+    is_redacted: bool = False
     id: int | None = None
-
 
 @dataclass
 class BackupRun:

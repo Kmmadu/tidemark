@@ -1,0 +1,54 @@
+/* Base QSS. Diff add/remove colours come from theme.py and are applied to
+   specific widgets at runtime so light/dark work without duplicating this. */
+
+QMainWindow, QDialog, QWizard {
+    background-color: palette(window);
+    color: palette(window-text);
+}
+
+QListWidget#sidebar {
+    background-color: palette(alternate-base);
+    border: none;
+    padding: 6px;
+}
+
+QListWidget#sidebar::item {
+    padding: 8px 12px;
+    border-radius: 6px;
+}
+
+QListWidget#sidebar::item:selected {
+    background-color: palette(highlight);
+    color: palette(highlighted-text);
+}
+
+QLabel#title {
+    font-size: 18px;
+    font-weight: 600;
+}
+
+QLabel#muted {
+    color: palette(mid);
+}
+
+QFrame#card {
+    background-color: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+QPushButton#primary {
+    padding: 6px 14px;
+    font-weight: 600;
+}
+
+QToolBar {
+    border: none;
+    spacing: 6px;
+}
+
+QTableView {
+    gridline-color: palette(mid);
+    alternate-background-color: palette(alternate-base);
+}

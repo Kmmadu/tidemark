@@ -11,6 +11,11 @@ Rules (M2a):
   run's snapshot id).
 - Normal snapshots go to ``<device>/running.cfg``; pre-restore snapshots
   (M2b) go to ``pre_restore/<device>/<YYYY>/<MM>/<sha>.cfg``.
+
+M3.1:
+- ``snapshots.is_redacted`` is set from ``store_raw`` at write time.
+- Refuse to save a snapshot whose normalised content already contains the
+  redaction marker; that would be a second pass over already-redacted data.
 """
 
 from __future__ import annotations
@@ -28,9 +33,10 @@ from tidemark.core.models import (
     Snapshot,
     VendorProfile,
 )
+from tidemark.core.redact import contains_redaction_marker
 from tidemark.store.db import Database
 from tidemark.store.git_repo import ConfigRepo
-from tidemark.store.repositories import RunRepo, SnapshotRepo
+from tidemark.store.repositories import RunRepo, SettingsRepo, SnapshotRepo
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +77,18 @@ def backup_and_persist(
         latest = snapshot_repo.latest_for_device(device.id)
         taken = result.finished_at_utc or datetime.now(UTC)
 
-        if latest is not None and latest.sha256 == result.sha256:
+        store_raw = (
+            SettingsRepo(db).get("store_raw") or "true"
+        ).lower() == "true"
+
+        if not store_raw and contains_redaction_marker(result.normalised_text):
+            # Defence in depth: refuse to save already-redacted content
+            # again. Not expected in practice, but cheap to guard.
+            logger.warning(
+                "refusing to save snapshot for %s: content already contains "
+                "the redaction marker", device.name,
+            )
+        elif latest is not None and latest.sha256 == result.sha256:
             # Same content as latest snapshot: reuse the row, no commit.
             snapshot_id = latest.id
         else:
@@ -85,13 +102,14 @@ def backup_and_persist(
                 path=str(path),
                 size=len(result.normalised_text or ""),
                 kind="normal",
+                is_redacted=not store_raw,
             )
             setattr(snap, "commit_sha", commit_sha)  # noqa: B010
             snapshot_repo.add(snap)
             snapshot_id = snap.id
             logger.info(
-                "snapshot for %s: sha=%s committed=%s",
-                device.name, result.sha256[:12], committed,
+                "snapshot for %s: sha=%s committed=%s redacted=%s",
+                device.name, result.sha256[:12], committed, not store_raw,
             )
 
     run = BackupRun(

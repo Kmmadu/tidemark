@@ -97,6 +97,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX idx_attempts_outcome ON restore_attempts(outcome, started_at_utc)",
         ],
     ),
+        (
+        3,
+        [
+            # M3.1: snapshots record whether their content was redacted at
+            # write time. Existing rows default to 0 (not redacted); the
+            # content-marker check in plan_restore covers pre-v3 rows that
+            # were redacted before the marker existed.
+            "ALTER TABLE snapshots ADD COLUMN is_redacted INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
 ]
 
 

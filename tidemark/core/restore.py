@@ -14,6 +14,7 @@ Flow:
 2. ``apply_restore()`` takes a plan and the token the user typed. It:
    - Refuses if the profile's ``restore`` is ``none`` or ``file_import``.
    - Refuses if the target snapshot is a pre-restore.
+   - Refuses if the target snapshot is redacted (M3.1).
    - Refuses if ``plan_hash`` does not match the current state (recompute).
    - Refuses if the typed token does not equal ``plan.confirm_token``.
    - Refuses if the list of acknowledged high-risk flag codes does not
@@ -29,6 +30,13 @@ Flow:
 The pre-restore snapshot is the safety net: because we do not save until
 verification passes, a device that fails to verify can be reloaded into its
 previous startup-config with no data loss.
+
+M3.1 additions:
+- ``plan_restore`` refuses three ways:
+    (a) the target snapshot has ``is_redacted=True``;
+    (b) the target content contains the redaction marker;
+    (c) ``store_raw`` is currently false (pre-restore snapshot would be
+        redacted and useless for recovery).
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from netmiko import ConnectHandler
 from tidemark.core.credentials import Credentials
 from tidemark.core.models import Device, RestoreMode, Snapshot, VendorProfile
 from tidemark.core.normalise import normalise
+from tidemark.core.redact import REDACTED_MARKER, contains_redaction_marker
 from tidemark.core.restore_blocks import (
     OperationKind,
     build_expected_post,
@@ -60,7 +69,7 @@ from tidemark.core.restore_risk_ios import (
 )
 from tidemark.store.db import Database
 from tidemark.store.git_repo import ConfigRepo
-from tidemark.store.repositories import SnapshotRepo
+from tidemark.store.repositories import SettingsRepo, SnapshotRepo
 from tidemark.store.restore_attempts import (
     AttemptOutcome,
     RestoreAttemptsRepo,
@@ -147,13 +156,11 @@ def _read_target_text(
     """Read target text from the git object at ``snapshot.commit_sha``."""
     commit_sha = getattr(snapshot, "commit_sha", None)
     if not commit_sha:
-        # Fall back to filesystem for snapshots created before M2a.
         from pathlib import Path
         return Path(snapshot.path).read_text(encoding="utf-8")
     rel = f"pre_restore/{_relative_from_path(snapshot.path, config_repo.root)}" \
         if "/pre_restore/" in snapshot.path.replace("\\", "/") else None
     if rel is None:
-        # Normal snapshot: reconstruct the relative path.
         rel = f"{_device_dir_of(snapshot)}/running.cfg"
     text = config_repo.read_at(commit_sha, rel)
     actual = _sha256(text.rstrip("\n"))
@@ -169,7 +176,6 @@ def _device_dir_of(snapshot: Snapshot) -> str:
     from pathlib import Path
     p = Path(snapshot.path)
     parts = p.parts
-    # configs/<device>/... — find the part after "configs"
     for i, part in enumerate(parts):
         if part == "configs" and i + 1 < len(parts):
             return parts[i + 1]
@@ -219,7 +225,36 @@ def plan_restore(
             "pre-restore snapshots cannot be used as restore targets"
         )
 
+    # M3.1 refusal (a): snapshot was stored with redaction enabled.
+    if getattr(target, "is_redacted", False):
+        raise RestoreModeError(
+            f"snapshot {target.id} was stored with redaction "
+            f"(store_raw=false); it contains placeholders and cannot be "
+            f"restored. Restores are only available from snapshots stored "
+            f"with store_raw=true."
+        )
+
     target_text = _read_target_text(config_repo, target)
+
+    # M3.1 refusal (b): defence in depth, catch pre-v3 rows whose
+    # is_redacted column defaults to 0 but whose content is redacted.
+    if contains_redaction_marker(target_text):
+        raise RestoreModeError(
+            f"snapshot {target.id} content contains {REDACTED_MARKER!r}; "
+            f"restoring it would set real secrets to the placeholder text."
+        )
+
+    # M3.1 refusal (c): store_raw is off, so the pre-restore snapshot
+    # we would capture would be redacted and useless for recovery.
+    store_raw_now = (
+        SettingsRepo(db).get("store_raw") or "true"
+    ).lower() == "true"
+    if not store_raw_now:
+        raise RestoreModeError(
+            "restore is disabled while store_raw=false: the pre-restore "
+            "snapshot would be redacted and useless for recovery."
+        )
+
     target_norm = normalise(target_text, profile.volatile_patterns)
 
     current_raw = config_repo.current_content(device.name) or ""

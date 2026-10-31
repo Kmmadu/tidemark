@@ -6,7 +6,7 @@ from pathlib import Path
 
 from tidemark.store.db import Database, migrate
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 def test_migrate_fresh(tmp_path: Path) -> None:

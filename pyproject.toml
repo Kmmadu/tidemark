@@ -21,6 +21,7 @@ gui = [
 
 [project.scripts]
 tidemark = "tidemark.cli.main:main"
+tidemark-gui = "tidemark.gui.app:main"
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["tidemark-requirements.txt"] }
